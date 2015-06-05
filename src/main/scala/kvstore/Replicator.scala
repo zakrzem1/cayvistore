@@ -37,8 +37,18 @@ class Replicator(val replica: ActorRef) extends Actor {
   }
 
   
-  /* TODO Behavior for the Replicator. */
+  /* TODO Behavior for the Replicator.
+  *
+  * TODO The sender reference when sending the Snapshot message must be the Replicator actor (not the primary replica actor or any other).
+  * */
   def receive: Receive = {
+    case r@Replicate(key, valueOpt, id) =>
+      valueOpt match {
+        case Some(v) => replica ! Replica.Insert(key, v,id)
+        case None => replica ! Remove(key, id)
+      }
+      //TODO wait for operation complete
+
     case _ =>
   }
 

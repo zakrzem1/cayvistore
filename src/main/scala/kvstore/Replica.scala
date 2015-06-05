@@ -2,6 +2,7 @@ package kvstore
 
 import akka.actor.{Actor, ActorRef, Props}
 import kvstore.Arbiter._
+import kvstore.Replicator.{SnapshotAck, Snapshot, Replicate}
 
 object Replica {
   sealed trait Operation {
@@ -44,25 +45,57 @@ class Replica(val arbiter: ActorRef, persistenceProps: Props) extends Actor {
 
   }
 
-  /* TODO Behavior for  the leader role. “Clients and The KV Protocol” section, respecting the consistency guarantees described in “Guarantees for clients contacting the primary replica”.*/
+  def replicateCurrentValues(replicator: ActorRef): Unit = {
+    var id:Long=0
+    kv foreach { case (k:String,v:String)=>
+      replicator ! Replicate(k, Option(v),id)
+      id = id + 1
+    }
+    //TODO should I wait for  Replicated(key, id) confirmation(s)?
+  }
+
+  /* TODO Behavior for  the leader role.
+    'Clients and The KV Protocol' section, respecting the consistency guarantees described in ï¿½Guarantees for clients contacting the primary replicaï¿½.*/
   val leader: Receive = {
     case op @ Insert(key, value, id) =>
-      kv.updated(key, value)
+      kv = kv.updated(key, value)
       replicateToSecondaries(op)
     case op@Remove(key, id) =>
     case op@Get(key, id)=>
     case fromArbiter:Replicas=>
-      fromArbiter.replicas // TODO these will be the keys for the secondaries map?
+      val added = fromArbiter.replicas -- secondaries.keySet
+      added.foreach { addedReplica =>
+        val addedReplicator = context.actorOf(Replicator.props(addedReplica))
+        replicators = replicators + addedReplicator
+        secondaries = secondaries.updated(addedReplica, addedReplicator)
+        replicateCurrentValues(addedReplicator)
+      }
+      val removed = secondaries.keySet -- fromArbiter.replicas
+      removed.foreach { removedReplica =>
+        secondaries = secondaries - removedReplica
+        replicators = secondaries.get(removedReplica).map(replicators - _).getOrElse(replicators)
+      }
+
     case _ =>
   }
 
+  var expectedSnapshotSeq:Long = 0
   /* TODO Behavior for the replica role. */
   val replica: Receive = {
     case Get(key, id) =>
       sender() ! GetResult(key, kv.get(key), id)
-      //TODO respect the guarantees described in “Guarantees for clients contacting the secondary replica”.
+      //TODO respect the guarantees described in ï¿½Guarantees for clients contacting the secondary replicaï¿½.
 
       // TODO accept replication events - Replication protocol
+    case s@Snapshot(key, valueOption, seq) => //Replicator signals new state of a key
+      seq - expectedSnapshotSeq match {
+        case x if x > 0 => println(s"$s is not in sequence: $expectedSnapshotSeq. ignoring...")
+        case x if x == 0 =>
+          kv = valueOption map { v => kv.updated(key, v) } getOrElse (kv - key)
+          sender() ! SnapshotAck(key, seq)
+        case x if x < 0 => sender() ! SnapshotAck(key, seq)
+      }
+      expectedSnapshotSeq = Math.max(expectedSnapshotSeq, seq+1)
     case _ =>
   }
 
