@@ -1,8 +1,15 @@
 package kvstore
 
 import akka.actor.{Actor, ActorRef, Props}
+import akka.util.Timeout
+import scala.concurrent.duration._
 import kvstore.Arbiter._
-import kvstore.Replicator.{SnapshotAck, Snapshot, Replicate}
+import kvstore.Persistence.{Persisted, Persist}
+import kvstore.Replicator.{Replicated, SnapshotAck, Snapshot, Replicate}
+import akka.pattern.ask
+import akka.pattern.pipe
+
+import scala.concurrent.Future
 
 object Replica {
   sealed trait Operation {
@@ -24,6 +31,8 @@ object Replica {
 class Replica(val arbiter: ActorRef, persistenceProps: Props) extends Actor {
   import Replica._
 
+  implicit val replicateAndPersistTimeout: Timeout = Timeout(100 millis)
+  import context.dispatcher
   /*
    * The contents of this actor is just a suggestion, you can implement it in any way you like.
    */
@@ -34,6 +43,8 @@ class Replica(val arbiter: ActorRef, persistenceProps: Props) extends Actor {
   // the current set of replicators
   var replicators = Set.empty[ActorRef]
 
+  val persistence = context.actorOf(persistenceProps)
+
   arbiter ! Join
 
   def receive = {
@@ -41,8 +52,10 @@ class Replica(val arbiter: ActorRef, persistenceProps: Props) extends Actor {
     case JoinedSecondary => context.become(replica)
   }
 
-  def replicateToSecondaries(op: Operation): Unit = secondaries foreach { case (secReplica, replicator)=>
-
+  def replicateToSecondaries(key:String, value:Option[String], id:Long): Iterable[Future[Replicated]] =
+    secondaries map {
+      case (replica:ActorRef, replicator:ActorRef) =>
+        (replicator ? Replicate(key,value,id)).mapTo[Replicated]
   }
 
   def replicateCurrentValues(replicator: ActorRef): Unit = {
@@ -54,14 +67,24 @@ class Replica(val arbiter: ActorRef, persistenceProps: Props) extends Actor {
     //TODO should I wait for  Replicated(key, id) confirmation(s)?
   }
 
+  def persist(op: Operation, value:Option[String]) = (persistence ? Persist(op.key, value, op.id)).mapTo[Persisted] map { persisted:Persisted =>
+    replicateToSecondaries(op.key,value, op.id) // TODO check if should wait for Replicated ack
+    OperationAck(op.id)
+  } recover{ case t:Throwable => OperationFailed(op.id)}
+
   /* TODO Behavior for  the leader role.
-    'Clients and The KV Protocol' section, respecting the consistency guarantees described in �Guarantees for clients contacting the primary replica�.*/
+      'Clients and The KV Protocol' section, respecting the consistency guarantees described in �Guarantees for clients contacting the primary replica�.*/
   val leader: Receive = {
     case op @ Insert(key, value, id) =>
+      val requestor = sender()
       kv = kv.updated(key, value)
-      replicateToSecondaries(op)
+      persist(op, Option(value)) pipeTo requestor
     case op@Remove(key, id) =>
+      val requestor = sender()
+      kv = kv - key
+      persist(op, None) pipeTo requestor
     case op@Get(key, id)=>
+      sender() ! GetResult(key, kv.get(key), id)
     case fromArbiter:Replicas=>
       val added = fromArbiter.replicas -- secondaries.keySet
       added.foreach { addedReplica =>
@@ -72,8 +95,11 @@ class Replica(val arbiter: ActorRef, persistenceProps: Props) extends Actor {
       }
       val removed = secondaries.keySet -- fromArbiter.replicas
       removed.foreach { removedReplica =>
+        val replicator = secondaries(removedReplica)
         secondaries = secondaries - removedReplica
-        replicators = secondaries.get(removedReplica).map(replicators - _).getOrElse(replicators)
+        replicators = replicators - replicator
+        context.stop(replicator)
+        context.stop(removedReplica)
       }
 
     case _ =>
@@ -85,14 +111,17 @@ class Replica(val arbiter: ActorRef, persistenceProps: Props) extends Actor {
     case Get(key, id) =>
       sender() ! GetResult(key, kv.get(key), id)
       //TODO respect the guarantees described in �Guarantees for clients contacting the secondary replica�.
-
       // TODO accept replication events - Replication protocol
     case s@Snapshot(key, valueOption, seq) => //Replicator signals new state of a key
+      val requestor = sender()
       seq - expectedSnapshotSeq match {
         case x if x > 0 => println(s"$s is not in sequence: $expectedSnapshotSeq. ignoring...")
         case x if x == 0 =>
           kv = valueOption map { v => kv.updated(key, v) } getOrElse (kv - key)
-          sender() ! SnapshotAck(key, seq)
+          (persistence ? Persist(key, valueOption, seq)).mapTo[Persisted] map { persisted: Persisted =>
+            replicateToSecondaries(key, valueOption, seq) // TODO check if should wait for Replicated ack
+            SnapshotAck(key, seq)
+          } pipeTo requestor
         case x if x < 0 => sender() ! SnapshotAck(key, seq)
       }
       expectedSnapshotSeq = Math.max(expectedSnapshotSeq, seq+1)
