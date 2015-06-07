@@ -1,9 +1,11 @@
 package kvstore
 
 import akka.actor.{Actor, ActorRef, Props}
-import akka.pattern.{ask, pipe}
+import akka.pattern.ask
+import akka.pattern.pipe
 import akka.util.Timeout
 
+import scala.concurrent.Future
 import scala.concurrent.duration._
 
 object Replicator {
@@ -23,6 +25,7 @@ class Replicator(val replica: ActorRef) extends Actor {
 
   import Replicator._
   import context.dispatcher
+  implicit val timeout: Timeout = Timeout(100 millis)
 
   /*
    * The contents of this actor is just a suggestion, you can implement it in any way you like.
@@ -41,17 +44,32 @@ class Replicator(val replica: ActorRef) extends Actor {
     ret
   }
 
+  def sendSnapshotToReplica(curSeq: Long, key: String, valueOpt: Option[String], replicateId: Long) = {
+    val reply:Future[Replicated] = (replica ? Snapshot(key, valueOpt, curSeq)).mapTo[SnapshotAck].map { snapAck =>
+      acks = acks - curSeq
+      Replicated(key, replicateId)
+    }
+    reply onFailure { case t => resendFailed(curSeq) }
+    reply
+  }
+
+  def resendFailed(seqNum: Long): Unit = {
+    val (initiator, replicateMsg) = acks(seqNum)
+    sendSnapshotToReplica(seqNum, replicateMsg.key, replicateMsg.valueOption, replicateMsg.id) pipeTo initiator
+  }
+
   /* TODO Behavior for the Replicator.
-    *
-    * TODO The sender reference when sending the Snapshot message must be the Replicator actor (not the primary replica actor or any other).
-    * */
+        *
+        * TODO The sender reference when sending the Snapshot message must be the Replicator actor
+        * (not the primary replica actor or any other).
+        * */
   def receive: Receive = {
     case r@Replicate(key, valueOpt, id) =>
       val replicateInitiator = sender()
-      implicit val timeout: Timeout = Timeout(100 millis)
-      (replica ? Snapshot(key, valueOpt, nextSeq)).mapTo[SnapshotAck].map { snapAck =>
-        Replicated(r.key, r.id)
-      } pipeTo replicateInitiator
+      val curSeq = nextSeq
+      acks = acks + (curSeq ->(replicateInitiator, r))
+      val reply = sendSnapshotToReplica(curSeq, key, valueOpt, id)
+      reply pipeTo replicateInitiator
     case x => println(s"[Replicator] Unhandled msg $x")
   }
 
