@@ -70,7 +70,9 @@ class Replica(val arbiter: ActorRef, persistenceProps: Props) extends Actor {
   def persist(op: Operation, value:Option[String]) = (persistence ? Persist(op.key, value, op.id)).mapTo[Persisted] map { persisted:Persisted =>
     replicateToSecondaries(op.key,value, op.id) // TODO check if should wait for Replicated ack
     OperationAck(op.id)
-  } recover{ case t:Throwable => OperationFailed(op.id)}
+  } recover{ case t:Throwable =>
+    println(s"[persist] failed with: $t")
+    OperationFailed(op.id)}
 
   /* TODO Behavior for  the leader role.
       'Clients and The KV Protocol' section, respecting the consistency guarantees described in �Guarantees for clients contacting the primary replica�.*/
@@ -106,26 +108,42 @@ class Replica(val arbiter: ActorRef, persistenceProps: Props) extends Actor {
   }
 
   var expectedSnapshotSeq:Long = 0
+
+  def updateKV(key: String, valueOption: Option[String]) = {
+    kv = valueOption map { v =>
+      println(s"[updateKV] : updating $key -> $v")
+      kv + (key -> v)
+    } getOrElse {
+      println(s"[updateKV] : removing key: $key ")
+      kv - key
+    }
+  }
+
   /* TODO Behavior for the replica role. */
   val replica: Receive = {
     case Get(key, id) =>
+      println(s"[get]($key) = ${kv.get(key)}")
       sender() ! GetResult(key, kv.get(key), id)
       //TODO respect the guarantees described in �Guarantees for clients contacting the secondary replica�.
       // TODO accept replication events - Replication protocol
     case s@Snapshot(key, valueOption, seq) => //Replicator signals new state of a key
       val requestor = sender()
       seq - expectedSnapshotSeq match {
-        case x if x > 0 => println(s"$s is not in sequence: $expectedSnapshotSeq. ignoring...")
+        case x if x > 0 => println(s"[snapshot] $s is not in sequence: expecting $expectedSnapshotSeq. ignoring...")
         case x if x == 0 =>
-          kv = valueOption map { v => kv.updated(key, v) } getOrElse (kv - key)
+          updateKV(key, valueOption)
+          println(s"[snapshot] $s in sequence. persisting...")
           (persistence ? Persist(key, valueOption, seq)).mapTo[Persisted] map { persisted: Persisted =>
-            replicateToSecondaries(key, valueOption, seq) // TODO check if should wait for Replicated ack
+            //replicateToSecondaries(key, valueOption, seq) // TODO check if should wait for Replicated ack
             SnapshotAck(key, seq)
           } pipeTo requestor
-        case x if x < 0 => sender() ! SnapshotAck(key, seq)
+          expectedSnapshotSeq = Math.max(expectedSnapshotSeq, seq+1)
+        case x if x < 0 =>
+          println(s"[snapshot] $s is outdated, ignoring")
+          sender() ! SnapshotAck(key, seq)
       }
-      expectedSnapshotSeq = Math.max(expectedSnapshotSeq, seq+1)
-    case _ =>
+
+    case x => println(s"[replica] unhandled: $x")
   }
 
 }

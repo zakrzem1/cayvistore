@@ -52,7 +52,7 @@ class Replicator(val replica: ActorRef) extends Actor {
       (replica ? Snapshot(key, valueOpt, nextSeq)).mapTo[SnapshotAck].map { snapAck =>
         Replicated(r.key, r.id)
       } pipeTo replicateInitiator
-    case _ =>
+    case x => println(s"[Replicator] Unhandled msg $x")
   }
 
 }
